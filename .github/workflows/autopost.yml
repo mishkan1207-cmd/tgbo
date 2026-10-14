@@ -1,0 +1,30 @@
+
+name: Telegram AI Autopost
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6,12,18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish AI post
+        env:
+          ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python bot.py
+        
