@@ -26,5 +26,5 @@ jobs:
           ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-        run: python bot.py
+        run: python tgbo.py
         
