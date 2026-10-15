@@ -139,16 +139,17 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/posted.json
+          git add -f state/posted.json 2>/dev/null || git add state/posted.json
           if git diff --cached --quiet; then
             echo "Изменений в истории нет."
             exit 0
           fi
           git commit -m "chore: обновить историю постов [skip ci]"
-          # Если репозиторий запрещает запись токену Actions, пост уже
-          # опубликован — не валим весь запуск из-за истории, но предупреждаем.
+          # Пост к этому моменту уже опубликован. Если репозиторий запрещает
+          # запись токену Actions, это не должно валить весь запуск —
+          # предупреждаем и оставляем job зелёным.
           if ! git push; then
-            echo "::warning::Не удалось сохранить историю постов (нет прав на запись)."
-            echo "Пост опубликован, но проверка на дубликаты между запусками работать не будет."
-            echo "Включите: Settings -> Actions -> General -> Workflow permissions -> Read and write."
+            echo "::warning::История постов не сохранилась: токену Actions запрещена запись."
+            echo "Пост опубликован, защита от дублей между запусками не работает."
+            echo "Включить: Settings -> Actions -> General -> Workflow permissions -> Read and write."
           fi
