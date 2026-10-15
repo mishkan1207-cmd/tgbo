@@ -1,0 +1,30 @@
+name: TEMP Find my chat id
+
+# Временный workflow: показывает chat_id, куда боту можно писать.
+# Нужен, чтобы отправить тестовый пост вам в личку, а не в канал.
+# Токен берётся из Secrets и в лог не попадает.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  find:
+    name: Найти chat_id
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Получить репозиторий
+        uses: actions/checkout@v4
+
+      - name: Настроить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Показать доступные чаты
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python tools/find_chat.py
