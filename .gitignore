@@ -1,0 +1,14 @@
+# Локальные служебные файлы — в репозиторий не попадают.
+.tools/
+state/
+*.log
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Никогда не коммитим ключи и токены.
+gh_token.txt
+device_code.json
+*_key.txt
+.env

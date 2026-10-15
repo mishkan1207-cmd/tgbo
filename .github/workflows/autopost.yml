@@ -1,30 +1,153 @@
-
 name: Telegram AI Autopost
 
+# Когда запускать.
+#   workflow_dispatch — кнопка "Run workflow" в интерфейсе GitHub.
+#   schedule          — автоматический запуск по расписанию.
+#
+# ВАЖНО: cron в GitHub Actions всегда работает в UTC, часового пояса у него нет.
+# Сейчас стоит время для Москвы (UTC+3):
+#     06:00 МСК = 03:00 UTC
+#     12:00 МСК = 09:00 UTC
+#     18:00 МСК = 15:00 UTC
+# GitHub может задержать запуск из очереди на 5–30 минут — это нормально.
+#
+# Если вы в другом часовом поясе, посчитайте свои значения по формуле:
+#     UTC-час = местный час − смещение от UTC
+# Например для UTC+5 (Екатеринбург), 09:00, 15:00, 21:00 по местному:
+#     cron: "0 4,10,16 * * *"
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только сгенерировать текст, в Telegram не отправлять"
+        type: boolean
+        default: false
+      test_chat_id:
+        description: "Отправить в этот чат вместо канала (для проверки; можно пустым)"
+        type: string
+        required: false
+        default: ""
+      force:
+        description: "Не считать дубликатом даже похожий на недавний пост"
+        type: boolean
+        default: false
+      custom_prompt:
+        description: "Дополнительное пожелание к теме поста (необязательно)"
+        type: string
+        required: false
+        default: ""
   schedule:
-    - cron: "0 6,12,18 * * *"
+    - cron: "0 3,9,15 * * *"
 
+# contents: write нужен только для того, чтобы сохранять историю постов
+# (state/posted.json) между запусками и не публиковать дубликаты.
 permissions:
-  contents: read
+  contents: write
+
+# Не допускать двух одновременных публикаций.
+concurrency:
+  group: tgbo-autopost
+  cancel-in-progress: false
+
+env:
+  # orca: бесплатные модели OrcaRouter с суффиксом -free (работает из России).
+  # Проверено: эндпоинт доступен, модели отвечают. Роутер orcarouter/free
+  # намеренно НЕ используется — он отдаёт 403 free_quota_exhausted и требует
+  # привязки GitHub-аккаунта.
+  # Можно переключить на "gemini" или "auto", если появится ключ Google.
+  AI_PROVIDER: "orca"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   publish:
+    name: Сгенерировать и опубликовать пост
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Get repository
+      - name: Получить репозиторий
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Publish AI post
+      - name: Проверить, что нужные Secrets заданы
         env:
           ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-        run: python tgbo.py
-        
+        run: |
+          missing=""
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && missing="$missing TELEGRAM_BOT_TOKEN"
+          [ -z "$CHANNEL_ID" ] && missing="$missing CHANNEL_ID"
+          [ -z "$ORCA_API_KEY" ] && missing="$missing ORCA_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Не заданы Secrets:$missing"
+            echo "Откройте Settings -> Secrets and variables -> Actions и добавьте их."
+            exit 1
+          fi
+          echo "Все нужные Secrets на месте."
+
+      - name: Настроить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Внешних зависимостей нет: tgbo.py использует только стандартную
+      # библиотеку, поэтому pip install не нужен.
+      - name: Проверить синтаксис
+        run: python -m py_compile tgbo.py
+
+      - name: Тесты логики (без сети)
+        run: python tests/test_tgbo.py
+
+      - name: Сгенерировать и опубликовать пост
+        env:
+          # Пользовательский текст из полей ручного запуска сначала попадает
+          # в переменные окружения, и только потом используется в оболочке.
+          # Так содержимое поля не может выполниться как команда.
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_TEST_CHAT: ${{ inputs.test_chat_id }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_CUSTOM_PROMPT: ${{ inputs.custom_prompt }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+        run: |
+          # Значения по умолчанию для запуска по расписанию: inputs там пустые.
+          DRY_RUN="${INPUT_DRY_RUN:-0}"
+          SKIP_DEDUP="${INPUT_FORCE:-0}"
+          TELEGRAM_TEST_CHAT_ID="${INPUT_TEST_CHAT:-}"
+          CUSTOM_PROMPT="${INPUT_CUSTOM_PROMPT:-}"
+          export DRY_RUN SKIP_DEDUP TELEGRAM_TEST_CHAT_ID CUSTOM_PROMPT
+
+          echo "Режим: DRY_RUN=$DRY_RUN, SKIP_DEDUP=$SKIP_DEDUP"
+          if [ -n "$TELEGRAM_TEST_CHAT_ID" ]; then
+            echo "Публикация пойдёт в тестовый чат, а не в канал."
+          fi
+
+          python tgbo.py
+
+      - name: Сохранить историю постов
+        # История нужна, чтобы не повторять недавние посты. Если публикации
+        # не было (dry-run или ошибка) — сохранять нечего.
+        if: ${{ inputs.dry_run != true && success() }}
+        run: |
+          if [ ! -f state/posted.json ]; then
+            echo "Файла истории нет — коммит не нужен."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/posted.json
+          if git diff --cached --quiet; then
+            echo "Изменений в истории нет."
+            exit 0
+          fi
+          git commit -m "chore: обновить историю постов [skip ci]"
+          # Если репозиторий запрещает запись токену Actions, пост уже
+          # опубликован — не валим весь запуск из-за истории, но предупреждаем.
+          if ! git push; then
+            echo "::warning::Не удалось сохранить историю постов (нет прав на запись)."
+            echo "Пост опубликован, но проверка на дубликаты между запусками работать не будет."
+            echo "Включите: Settings -> Actions -> General -> Workflow permissions -> Read and write."
+          fi
