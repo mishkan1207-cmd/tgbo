@@ -221,37 +221,97 @@ class TestResponseSanitising(unittest.TestCase):
 
 
 class TestProviderSelection(unittest.TestCase):
-    def test_auto_prefers_gemini(self):
-        saved = dict(os.environ)
-        try:
-            os.environ["AI_PROVIDER"] = "auto"
-            os.environ["GEMINI_API_KEY"] = "x"
-            os.environ.pop("ORCA_API_KEY", None)
-            self.assertEqual(tgbo.provider_order()[0], "gemini")
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
+    def setUp(self):
+        self.saved = dict(os.environ)
+        for name in ("AI_PROVIDER", "AI_MODEL", "ORCA_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            os.environ.pop(name, None)
 
-    def test_explicit_orca(self):
-        saved = dict(os.environ)
-        try:
-            os.environ["AI_PROVIDER"] = "orca"
-            self.assertEqual(tgbo.provider_order(), ["orca"])
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
 
-    def test_orca_first_when_only_orca_key_present(self):
-        saved = dict(os.environ)
-        try:
-            os.environ["AI_PROVIDER"] = "auto"
-            os.environ.pop("GEMINI_API_KEY", None)
-            os.environ.pop("GOOGLE_API_KEY", None)
-            os.environ["ORCA_API_KEY"] = "x"
-            self.assertEqual(tgbo.provider_order()[0], "orca")
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
+    def names(self):
+        return [p.name for p in tgbo.provider_order()]
+
+    def test_auto_starts_with_llm7(self):
+        """LLM7 работает без ключа, поэтому всегда первый."""
+        self.assertEqual(self.names()[0], "LLM7")
+
+    def test_auto_includes_pollinations(self):
+        self.assertIn("Pollinations", self.names())
+
+    def test_optional_providers_hidden_without_key(self):
+        names = self.names()
+        self.assertNotIn("OrcaRouter", names)
+        self.assertNotIn("Gemini", names)
+
+    def test_optional_providers_appear_with_key(self):
+        os.environ["ORCA_API_KEY"] = "test-key"
+        os.environ["GEMINI_API_KEY"] = "test-key"
+        names = self.names()
+        self.assertIn("OrcaRouter", names)
+        self.assertIn("Gemini", names)
+
+    def test_explicit_provider_selection(self):
+        os.environ["AI_PROVIDER"] = "gemini"
+        self.assertEqual(self.names(), ["Gemini"])
+        os.environ["AI_PROVIDER"] = "llm7"
+        self.assertEqual(self.names(), ["LLM7"])
+        os.environ["AI_PROVIDER"] = "orca"
+        self.assertEqual(self.names(), ["OrcaRouter"])
+
+    def test_unknown_provider_falls_back_to_auto(self):
+        os.environ["AI_PROVIDER"] = "чепуха"
+        self.assertEqual(self.names()[0], "LLM7")
+
+    def test_keyless_endpoints_send_no_auth_header(self):
+        for provider in tgbo.PROVIDERS:
+            if not provider.key_env:
+                with self.subTest(provider=provider.name):
+                    self.assertEqual(provider.headers(), {})
+
+    def test_ai_model_override_applies_to_llm7(self):
+        os.environ["AI_MODEL"] = "model-one, model-two"
+        llm7 = next(p for p in tgbo.PROVIDERS if p.name == "LLM7")
+        self.assertEqual(llm7.model_list(), ["model-one", "model-two"])
+
+    def test_model_env_is_not_leaked_between_providers(self):
+        """ORCA_MODEL не должен влиять на LLM7 и наоборот."""
+        os.environ["ORCA_MODEL"] = "orca-only-model"
+        llm7 = next(p for p in tgbo.PROVIDERS if p.name == "LLM7")
+        self.assertNotIn("orca-only-model", llm7.model_list())
+
+
+class TestRetryAfter(unittest.TestCase):
+    def test_reads_header(self):
+        self.assertEqual(tgbo._parse_retry_after("14", ""), 14.0)
+
+    def test_reads_from_body_text(self):
+        body = '{"error":{"message":"Rate limit exceeded. Retry after 14 seconds."}}'
+        self.assertEqual(tgbo._parse_retry_after(None, body), 14.0)
+
+    def test_body_variants(self):
+        for text in ("retry_after: 7", "Retry After 7", '"retry_after": 7'):
+            with self.subTest(text=text):
+                self.assertEqual(tgbo._parse_retry_after(None, text), 7.0)
+
+    def test_capped_at_maximum(self):
+        self.assertEqual(tgbo._parse_retry_after("9999", ""), float(tgbo.MAX_RETRY_WAIT))
+
+    def test_none_when_absent(self):
+        self.assertIsNone(tgbo._parse_retry_after(None, "no hint here"))
+        self.assertIsNone(tgbo._parse_retry_after("", ""))
+
+    def test_garbage_header_ignored(self):
+        self.assertIsNone(tgbo._parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", ""))
+
+    def test_provider_error_carries_retry_after(self):
+        error = tgbo.ProviderError("boom", retryable=True, retry_after=12.0)
+        self.assertEqual(error.retry_after, 12.0)
+        self.assertTrue(error.retryable)
+
+    def test_provider_error_defaults_to_none(self):
+        self.assertIsNone(tgbo.ProviderError("boom").retry_after)
 
 
 class TestModuleSafety(unittest.TestCase):
@@ -281,16 +341,30 @@ class TestModuleSafety(unittest.TestCase):
         """Ключи читаются из окружения, а не из констант в коде."""
         with open(os.path.join(ROOT, "tgbo.py"), "r", encoding="utf-8") as handle:
             source = handle.read()
-        self.assertIn('os.getenv("GEMINI_API_KEY")', source)
-        self.assertIn('os.getenv("TELEGRAM_BOT_TOKEN")', source)
+
+        # Все провайдеры, которым нужен ключ, должны объявлять имя переменной
+        # окружения, а не хранить сам ключ.
+        for provider in tgbo.PROVIDERS:
+            if provider.key_env:
+                with self.subTest(provider=provider.name):
+                    for env_name in provider.key_env:
+                        self.assertTrue(
+                            env_name.isupper(),
+                            f"{provider.name}: имя переменной окружения должно быть в верхнем регистре",
+                        )
+
+        self.assertIn("TELEGRAM_BOT_TOKEN", source)
+        self.assertIn("os.getenv", source)
+
         # Ни одна ключевая переменная не должна присваиваться из литерала.
         for name in ("GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "ORCA_API_KEY"):
             with self.subTest(name=name):
                 self.assertNotRegex(source, rf'{name}\s*=\s*["\'][^"\']+["\']')
 
     def test_provider_urls_are_https(self):
-        self.assertTrue(tgbo.GEMINI_URL.startswith("https://"))
-        self.assertTrue(tgbo.ORCA_URL.startswith("https://"))
+        for provider in tgbo.PROVIDERS:
+            with self.subTest(provider=provider.name):
+                self.assertTrue(provider.url.startswith("https://"))
 
     def test_payload_builder_has_no_key_parameter(self):
         """Тело запроса собирается без ключа — ключ идёт только в заголовок."""

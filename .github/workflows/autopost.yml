@@ -50,12 +50,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # orca: бесплатные модели OrcaRouter с суффиксом -free (работает из России).
-  # Проверено: эндпоинт доступен, модели отвечают. Роутер orcarouter/free
-  # намеренно НЕ используется — он отдаёт 403 free_quota_exhausted и требует
-  # привязки GitHub-аккаунта.
-  # Можно переключить на "gemini" или "auto", если появится ключ Google.
-  AI_PROVIDER: "orca"
+  # auto: цепочка бесплатных роутеров по порядку.
+  #   1. LLM7.io        — бесплатно, БЕЗ ключа (основной)
+  #   2. Pollinations   — бесплатно, без ключа (резерв)
+  #   3. OrcaRouter     — только если ORCA_API_KEY задан и модели разрешены
+  #   4. Gemini         — только если задан GEMINI_API_KEY
+  # Если один роутер недоступен, бот сам переходит к следующему.
+  AI_PROVIDER: "auto"
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -69,21 +70,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Проверить, что нужные Secrets заданы
+        # Обязателен только Telegram. Ключи ИИ не нужны: основные роутеры
+        # (LLM7, Pollinations) работают без ключа.
         env:
-          ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: |
           missing=""
           [ -z "$TELEGRAM_BOT_TOKEN" ] && missing="$missing TELEGRAM_BOT_TOKEN"
           [ -z "$CHANNEL_ID" ] && missing="$missing CHANNEL_ID"
-          [ -z "$ORCA_API_KEY" ] && missing="$missing ORCA_API_KEY"
           if [ -n "$missing" ]; then
             echo "::error::Не заданы Secrets:$missing"
             echo "Откройте Settings -> Secrets and variables -> Actions и добавьте их."
             exit 1
           fi
-          echo "Все нужные Secrets на месте."
+          echo "Secrets для Telegram на месте. Ключ ИИ не требуется."
 
       - name: Настроить Python
         uses: actions/setup-python@v5

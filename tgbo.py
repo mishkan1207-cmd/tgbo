@@ -50,37 +50,52 @@ RETRY_DELAYS = (5, 20)         # паузы между повторами вну
 # таймаут job'а (в workflow стоит timeout-minutes: 10).
 GENERATION_BUDGET_SECONDS = 300
 MAX_GENERATION_ATTEMPTS = 3    # сколько раз просить пост у одного провайдера
+MAX_RETRY_WAIT = 60            # максимум секунд ожидания по Retry-After
 RECENT_KEEP = 20               # сколько последних постов хранить в state
 DEDUP_THRESHOLD = 0.75         # схожесть шинглов, выше — дубликат
 
-# Основной провайдер: Google Gemini, бесплатный тариф Google AI Studio.
-# Ключ выдаётся на https://aistudio.google.com/apikey — без оплаты и без карты.
-# Базовая оплата НЕ требуется для тарифа Free (см. ai.google.dev/gemini-api/docs/pricing).
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-# Модели перебираются по порядку, пока какая-нибудь не ответит. Набор моделей
-# бесплатного тарифа меняется, а часть id может быть недоступна — поэтому
-# список, а не одна модель. Переопределяется через AI_MODEL.
-GEMINI_MODELS = (
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
+# --------------------------------------------------------------------------
+# Провайдеры (роутеры бесплатных моделей)
+# --------------------------------------------------------------------------
+# Порядок: сначала самый стабильный и качественный, дальше — резервы.
+# Все они OpenAI-совместимы, поэтому код запроса одинаковый.
+
+# 1) LLM7.io — бесплатный роутер, работает вообще БЕЗ ключа.
+#    Проверено: отвечает, понимает русский. Есть рейт-лимит, который API
+#    сообщает сам («Retry after N seconds») — tgbo.py его уважает.
+LLM7_URL = "https://api.llm7.io/v1/chat/completions"
+LLM7_MODELS = (
+    "DeepSeek-V4-Flash-0731",
+    "GLM-5.3-Flash",
+    "minimax-m2.7",
+    "gpt-oss:20b",
+    "mistral-Nemo-Instruct-2407",
 )
 
-# Резервный провайдер — OrcaRouter. Бесплатные модели с суффиксом -free стоят
-# $0 за запрос (поле pricing с одним "request": "0.000000").
-# ВАЖНО: роутер "orcarouter/free" НЕ используется. Если у него нет доступной
-# бесплатной модели, он отвечает 403 free_quota_exhausted, и хуже того —
-# требует привязать «зрелый» GitHub-аккаунт (err_free_access_denied).
-# Обычные -free модели такого требования не имеют, поэтому берём их напрямую.
-# Список актуален на момент проверки: GET /api/free-package/public
+# 2) Pollinations — тоже бесплатный и без ключа.
+#    Проверено: генерирует хорошие русские посты. Изредка отдаёт HTTP 402
+#    (перегрузка) — тогда просто переходим к следующему провайдеру.
+POLLINATIONS_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_MODELS = ("openai", "openai-fast")
+
+# 3) OrcaRouter — необязательный резерв. Включается только если задан
+#    ORCA_API_KEY и модели разрешены этому ключу. Роутер "orcarouter/free"
+#    намеренно не используется: он отдаёт 403 free_quota_exhausted и требует
+#    привязки «зрелого» GitHub-аккаунта (err_free_access_denied).
 ORCA_URL = "https://api.orcarouter.ai/v1/chat/completions"
 ORCA_MODELS = (
     "deepseek/deepseek-v4-flash-free",
     "z-ai/glm-5.3-flash-free",
-    "tencent/hy4-preview-free",
     "tencent/hy3-free",
+)
+
+# 4) Google Gemini — необязательный резерв, если у вас есть ключ.
+#    Внимание: консоль Google AI Studio недоступна из России.
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_MODELS = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
 )
 
 SYSTEM_PROMPT = (
@@ -114,9 +129,18 @@ class BotError(RuntimeError):
 class ProviderError(BotError):
     """Провайдер недоступен или отверг запрос."""
 
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        # Если API сам сказал, сколько ждать (HTTP 429 + Retry-After),
+        # ждём ровно столько, а не наугад.
+        self.retry_after = retry_after
 
 
 def log(message: str) -> None:
@@ -159,9 +183,12 @@ def http_json(
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:  # pragma: no cover - тело может быть недоступно
             pass
+
+        retry_after = _parse_retry_after(exc.headers.get("Retry-After"), body)
         raise ProviderError(
             f"HTTP {exc.code} {exc.reason} — {_short(body, 600)}",
             retryable=exc.code in (408, 409, 425, 429, 500, 502, 503, 504),
+            retry_after=retry_after,
         ) from exc
     except urllib.error.URLError as exc:
         raise ProviderError(f"Сеть недоступна: {exc.reason}") from exc
@@ -185,6 +212,33 @@ def _short(text: str, limit: int) -> str:
     """Обрезать длинный текст для логов и сообщений об ошибке."""
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _parse_retry_after(header: str | None, body: str) -> float | None:
+    """Сколько секунд просит подождать API.
+
+    Берём из заголовка Retry-After, а если его нет — из текста ошибки вида
+    «Rate limit exceeded. Retry after 14 seconds». Больше MAX_RETRY_WAIT не ждём.
+    """
+    candidates: list[float] = []
+
+    if header:
+        try:
+            candidates.append(float(str(header).strip()))
+        except (TypeError, ValueError):
+            pass
+
+    if body:
+        match = re.search(r"retry[_ -]?after[\"'\s:]*(\d+(?:\.\d+)?)", body, re.IGNORECASE)
+        if match:
+            try:
+                candidates.append(float(match.group(1)))
+            except ValueError:
+                pass
+
+    if not candidates:
+        return None
+    return max(0.0, min(max(candidates), MAX_RETRY_WAIT))
 
 
 # --------------------------------------------------------------------------
@@ -446,18 +500,72 @@ def extract_text(response: dict) -> str:
     return content
 
 
-def gemini_models() -> list[str]:
-    override = os.getenv("AI_MODEL", "").strip()
-    if override:
-        return [item.strip() for item in override.split(",") if item.strip()]
-    return list(GEMINI_MODELS)
+class Endpoint:
+    """Один роутер бесплатных моделей.
+
+    `key_env` — какие переменные окружения искать для ключа. Пустой кортеж
+    означает, что роутер работает без ключа (LLM7, Pollinations).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        models: tuple[str, ...],
+        key_env: tuple[str, ...] = (),
+        model_env: str = "",
+        optional: bool = False,
+    ) -> None:
+        self.name = name
+        self.url = url
+        self.models = models
+        self.key_env = key_env
+        self.model_env = model_env
+        self.optional = optional
+
+    def api_key(self) -> str:
+        for name in self.key_env:
+            value = (os.getenv(name) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def available(self) -> bool:
+        """Можно ли пробовать этот роутер.
+
+        Резервные (optional) роутеры требуют ключ. Основные бесплатные
+        роутеры работают всегда.
+        """
+        if not self.key_env:
+            return True
+        return bool(self.api_key())
+
+    def model_list(self) -> list[str]:
+        if self.model_env:
+            override = (os.getenv(self.model_env) or "").strip()
+            if override:
+                return [item.strip() for item in override.split(",") if item.strip()]
+        return list(self.models)
+
+    def headers(self) -> dict[str, str]:
+        key = self.api_key()
+        if not key:
+            return {}
+        headers = {"Authorization": f"Bearer {key}"}
+        if "generativelanguage.googleapis.com" in self.url:
+            # Ключ заголовком, а не в ?key= — иначе он попадёт в логи URL.
+            headers["x-goog-api-key"] = key
+        return headers
 
 
-def orca_models() -> list[str]:
-    override = os.getenv("ORCA_MODEL", "").strip()
-    if override:
-        return [item.strip() for item in override.split(",") if item.strip()]
-    return list(ORCA_MODELS)
+PROVIDERS = (
+    Endpoint("LLM7", LLM7_URL, LLM7_MODELS, model_env="AI_MODEL"),
+    Endpoint("Pollinations", POLLINATIONS_URL, POLLINATIONS_MODELS),
+    Endpoint("OrcaRouter", ORCA_URL, ORCA_MODELS, key_env=("ORCA_API_KEY",),
+             model_env="ORCA_MODEL", optional=True),
+    Endpoint("Gemini", GEMINI_URL, GEMINI_MODELS,
+             key_env=("GEMINI_API_KEY", "GOOGLE_API_KEY"), optional=True),
+)
 
 
 def _sleep_plan(started: float) -> list[int]:
@@ -468,73 +576,69 @@ def _sleep_plan(started: float) -> list[int]:
     return [delay for delay in RETRY_DELAYS if delay <= left]
 
 
-def generate_with_gemini(api_key: str, note: str) -> tuple[str, str]:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        # Заголовок вместо ?key= — ключ не попадает в URL и в логи.
-        "x-goog-api-key": api_key,
-    }
+def _remaining(started: float) -> float:
+    return GENERATION_BUDGET_SECONDS - (time.monotonic() - started)
+
+
+def generate_from(provider: Endpoint, note: str) -> tuple[str, str]:
+    """Перебрать модели одного роутера. Вернуть (текст, имя модели)."""
+    headers = provider.headers()
     last_error: Exception | None = None
     started = time.monotonic()
 
-    for model in gemini_models():
-        for attempt, delay in enumerate((0, *_sleep_plan(started)), start=1):
-            if delay:
-                log(f"Gemini/{model}: пауза {delay} с перед повтором {attempt}")
-                time.sleep(delay)
+    for model in provider.model_list():
+        # Ждать по Retry-After разрешено не дольше бюджета.
+        waits = _sleep_plan(started)
+        attempt = 0
+        while True:
             try:
-                response = http_json(GEMINI_URL, build_payload(model, note), headers)
-                text = extract_text(response)
-                return text, model
+                response = http_json(provider.url, build_payload(model, note), headers)
+                return extract_text(response), model
             except ProviderError as exc:
                 last_error = exc
-                log(f"Gemini/{model}: ошибка — {exc}")
+                log(f"{provider.name}/{model}: ошибка — {exc}")
+
                 if not exc.retryable:
-                    break  # модель недоступна/запрос отвергнут — берём следующую
+                    break  # модель недоступна — сразу берём следующую
 
-    raise ProviderError(f"Gemini: все модели не сработали. Последняя ошибка: {last_error}")
+                # API может сам сказать, сколько ждать (HTTP 429).
+                if exc.retry_after is not None:
+                    if exc.retry_after > _remaining(started):
+                        log(
+                            f"{provider.name}/{model}: просят подождать "
+                            f"{exc.retry_after:.0f} с — это дольше бюджета, беру другую модель"
+                        )
+                        break
+                    log(f"{provider.name}/{model}: жду {exc.retry_after:.0f} с (просит API)")
+                    time.sleep(exc.retry_after)
+                    continue
 
+                if attempt < len(waits):
+                    delay = waits[attempt]
+                    attempt += 1
+                    log(f"{provider.name}/{model}: пауза {delay} с перед повтором {attempt}")
+                    time.sleep(delay)
+                    continue
+                break
 
-def generate_with_orca(api_key: str, note: str) -> tuple[str, str]:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    last_error: Exception | None = None
-    started = time.monotonic()
-
-    for model in orca_models():
-        for attempt, delay in enumerate((0, *_sleep_plan(started)), start=1):
-            if delay:
-                log(f"Orca/{model}: пауза {delay} с перед повтором {attempt}")
-                time.sleep(delay)
-            try:
-                response = http_json(ORCA_URL, build_payload(model, note), headers)
-                text = extract_text(response)
-                return text, model
-            except ProviderError as exc:
-                last_error = exc
-                log(f"Orca/{model}: ошибка — {exc}")
-                if not exc.retryable:
-                    break
-
-    raise ProviderError(f"OrcaRouter: все модели не сработали. Последняя ошибка: {last_error}")
+    raise ProviderError(f"{provider.name}: ни одна модель не ответила. Последняя ошибка: {last_error}")
 
 
-def provider_order() -> list[str]:
-    requested = os.getenv("AI_PROVIDER", "auto").strip().lower()
-    if requested in ("gemini", "google"):
-        return ["gemini"]
-    if requested in ("orca", "orcarouter"):
-        return ["orca"]
+def provider_order() -> list[Endpoint]:
+    """Какие роутеры пробовать и в каком порядке."""
+    requested = (os.getenv("AI_PROVIDER") or "auto").strip().lower()
+    named = {p.name.lower(): p for p in PROVIDERS}
+
+    if requested in ("llm7", "pollinations", "orcarouter", "orca", "gemini", "google"):
+        alias = {"orca": "orcarouter", "google": "gemini"}.get(requested, requested)
+        chosen = named[alias]
+        return [chosen]
+
     if requested not in ("auto", ""):
         log(f"Неизвестный AI_PROVIDER={requested!r}; использую auto")
-    if os.getenv("ORCA_API_KEY") and not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
-        return ["orca", "gemini"]
-    return ["gemini", "orca"]
 
-
-def api_key_for(provider: str) -> str:
-    if provider == "gemini":
-        return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-    return (os.getenv("ORCA_API_KEY") or "").strip()
+    # auto: все доступные роутеры по порядку приоритета.
+    return [p for p in PROVIDERS if p.available()]
 
 
 def create_post(recent: list[dict], enforce_dedup: bool = True) -> tuple[str, str, str]:
@@ -561,28 +665,20 @@ def create_post(recent: list[dict], enforce_dedup: bool = True) -> tuple[str, st
 
     errors: list[str] = []
     for provider in provider_order():
-        key = api_key_for(provider)
-        if not key:
-            errors.append(f"{provider}: ключ не задан")
-            continue
-
         note = base_note
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             try:
-                log(f"Генерирую пост через {provider} (попытка {attempt})")
-                if provider == "gemini":
-                    raw, model = generate_with_gemini(key, note)
-                else:
-                    raw, model = generate_with_orca(key, note)
+                log(f"Генерирую пост через {provider.name} (попытка {attempt})")
+                raw, model = generate_from(provider, note)
             except ProviderError as exc:
-                errors.append(f"{provider}: {exc}")
-                break
+                errors.append(f"{provider.name}: {exc}")
+                break  # этот роутер исчерпан — переходим к следующему
 
             try:
                 text = validate_post(clean_post(raw))
             except BotError as exc:
                 log(f"Ответ отклонён: {exc}")
-                errors.append(f"{provider}: {exc}")
+                errors.append(f"{provider.name}: {exc}")
                 note = base_note + (
                     "\n\nПредыдущий ответ не подошёл: нужен обычный текст поста "
                     "без markdown, пояснений и служебных фраз."
@@ -596,14 +692,14 @@ def create_post(recent: list[dict], enforce_dedup: bool = True) -> tuple[str, st
                         "Пост похож на опубликованный "
                         f"{duplicate.get('posted_at', '?')} — прошу другой"
                     )
-                    errors.append(f"{provider}: дубликат недавнего поста")
+                    errors.append(f"{provider.name}: дубликат недавнего поста")
                     note = base_note + (
                         "\n\nЭтот вариант повторяет прошлый пост. "
                         "Напиши на совершенно другую тему."
                     )
                     continue
 
-            return text, provider, model
+            return text, provider.name, model
 
     raise BotError("Не удалось получить пост. Причины: " + "; ".join(errors[-6:]))
 
