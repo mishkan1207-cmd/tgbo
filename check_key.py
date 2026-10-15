@@ -50,6 +50,35 @@ def mask(value: str) -> str:
     return f"(задан, {len(value)} символов)"
 
 
+def list_key_models(url_root: str, headers: dict) -> list[str]:
+    """Спросить у API, какие модели разрешены этому ключу.
+
+    GET /v1/models с ключом возвращает каталог, ограниченный правами ключа.
+    Если ключ ничего не может, список будет пустым или коротким.
+    """
+    request = urllib.request.Request(
+        f"{url_root}/models",
+        headers={**headers, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return [f"<ошибка HTTP {exc.code}: {body[:200]}>"]
+    except Exception as exc:  # noqa: BLE001
+        return [f"<ошибка {type(exc).__name__}: {exc}>"]
+
+    items = data.get("data")
+    if not isinstance(items, list):
+        return [f"<неожиданный формат: {json.dumps(data, ensure_ascii=False)[:200]}>"]
+    return [str(m.get("id", "?")) for m in items if isinstance(m, dict)]
+
+
 def describe_error(code: int, body: str) -> str:
     """Перевести ответ API в понятное объяснение."""
     text = body.lower()
@@ -160,9 +189,41 @@ def main() -> int:
         print(f"AI_MODEL={','.join(working)}")
         return 0
 
-    print("Ни одна модель не ответила.")
-    print("Если везде 401 — ключ неверный. Если 403 free_quota_exhausted —")
-    print("у бесплатных моделей сейчас нет ёмкости, попробуйте позже.")
+    print("Ни одна из проверенных моделей не ответила.")
+    print()
+
+    # Показываем, какие модели вообще разрешены этому ключу.
+    if provider != "gemini":
+        print("Модели, доступные ИМЕННО ЭТОМУ ключу (по данным GET /v1/models):")
+        allowed = list_key_models("https://api.orcarouter.ai/v1", headers)
+        if len(allowed) == 1 and allowed[0].startswith("<"):
+            print(f"  {allowed[0]}")
+        elif not allowed:
+            print("  СПИСОК ПУСТ — у ключа не разрешена ни одна модель.")
+            print("  Откройте консоль OrcaRouter и добавьте модели в права ключа:")
+            print("  https://www.orcarouter.ai/console/token")
+        else:
+            for model in allowed[:60]:
+                free = "  <- бесплатная" if model.endswith("-free") else ""
+                print(f"  {model}{free}")
+            print()
+            free_allowed = [m for m in allowed if m.endswith("-free")]
+            if free_allowed:
+                print("Из них бесплатные — их и стоит разрешить ключу:")
+                for model in free_allowed:
+                    print(f"  {model}")
+                print()
+                print("Затем задайте их боту:")
+                print(f"AI_MODEL={','.join(free_allowed[:4])}")
+            else:
+                print("Среди разрешённых моделей бесплатных нет.")
+                print("Добавьте в права ключа бесплатные id, например:")
+                print("  deepseek/deepseek-v4-flash-free")
+
+    print()
+    print("Если везде 401 — ключ неверный.")
+    print("Если 403 model_access_denied / block_key_scope — ключу не разрешены")
+    print("эти модели: включите их в консоли OrcaRouter (ссылка выше).")
     return 1
 
 
