@@ -45,12 +45,19 @@ TELEGRAM_LIMIT = 4096          # жёсткий лимит Telegram на дли�
 MAX_POST_CHARS = 1200          # наш собственный лимит: пост должен быть коротким
 MIN_POST_CHARS = 80            # меньше — считаем ответ мусором
 HTTP_TIMEOUT = 60              # секунд на один HTTP-запрос
-RETRY_DELAYS = (5, 20)         # паузы между повторами внутри одной модели
 # Всё время на генерацию. Защита от того, что медленный провайдер съест
 # таймаут job'а (в workflow стоит timeout-minutes: 10).
 GENERATION_BUDGET_SECONDS = 300
+# Сколько максимум тратим на ОДИН роутер. Без этого медленный роутер
+# съедал весь бюджет, и job уходил в таймаут (так и случилось 16.10).
+PROVIDER_BUDGET_SECONDS = 90
 MAX_GENERATION_ATTEMPTS = 3    # сколько раз просить пост у одного провайдера
-MAX_RETRY_WAIT = 60            # максимум секунд ожидания по Retry-After
+# Если API просит подождать дольше этого — не ждём, берём другую модель.
+# 35 с выбрано так, чтобы уложиться в лимит Pollinations («1 ответ в 30 с»),
+# но сразу отсечь дневную квоту LLM7 («Retry after 88000 seconds»).
+MAX_RETRY_WAIT = 35
+# Паузы между повторами внутри одной модели: короткие, чтобы не тянуть job.
+RETRY_DELAYS = (3, 8)
 # Запас токенов: reasoning-модели тратят часть бюджета на скрытые
 # размышления, поэтому 700 не хватало и приходил пустой content.
 MAX_TOKENS = 1500
@@ -64,22 +71,28 @@ DEDUP_THRESHOLD = 0.75         # схожесть шинглов, выше — �
 # Все они OpenAI-совместимы, поэтому код запроса одинаковый.
 
 # 1) LLM7.io — бесплатный роутер, работает вообще БЕЗ ключа.
-#    Проверено: отвечает, понимает русский. Есть рейт-лимит, который API
-#    сообщает сам («Retry after N seconds») — tgbo.py его уважает.
+#    Проверено: отвечает, понимает русский.
+#    ВАЖНО про лимиты (проверено на практике):
+#      * у каждой модели СВОЯ дневная квота токенов;
+#      * лимит считается на IP-адрес;
+#      * при исчерпании API отвечает 429 и «Retry after 88000 seconds».
+#    Поэтому модели перебираются по порядку, а долгое ожидание не соблюдается —
+#    бот сразу берёт следующую модель.
+#    DeepSeek-V4-Flash-0731 стоит первым: он стабильнее прочих отдаёт текст.
 LLM7_URL = "https://api.llm7.io/v1/chat/completions"
 LLM7_MODELS = (
     "DeepSeek-V4-Flash-0731",
     "GLM-5.3-Flash",
     "minimax-m2.7",
-    "gpt-oss:20b",
     "mistral-Nemo-Instruct-2407",
+    "codestral-latest",
 )
 
-# 2) Pollinations — тоже бесплатный и без ключа.
-#    Проверено: генерирует хорошие русские посты. Изредка отдаёт HTTP 402
-#    (перегрузка) — тогда просто переходим к следующему провайдеру.
+# 2) Pollinations — тоже без ключа, но у него серьёзные ограничения:
+#    лимит «1 ответ в 30 секунд на IP» и КЭШИРОВАНИЕ ответов (два разных
+#    запроса вернули побитово одинаковый текст). Поэтому он только резерв.
 POLLINATIONS_URL = "https://text.pollinations.ai/openai"
-POLLINATIONS_MODELS = ("openai", "openai-fast")
+POLLINATIONS_MODELS = ("openai",)
 
 # 3) OrcaRouter — необязательный резерв. Включается только если задан
 #    ORCA_API_KEY и модели разрешены этому ключу. Роутер "orcarouter/free"
@@ -660,15 +673,16 @@ PROVIDERS = (
 
 
 def _sleep_plan(started: float) -> list[int]:
-    """Сколько секунд ждать между попытками, укладываясь в бюджет генерации."""
-    left = GENERATION_BUDGET_SECONDS - (time.monotonic() - started)
+    """Сколько секунд ждать между попытками внутри одного роутера."""
+    left = PROVIDER_BUDGET_SECONDS - (time.monotonic() - started)
     if left <= 1:
         return []
     return [delay for delay in RETRY_DELAYS if delay <= left]
 
 
 def _remaining(started: float) -> float:
-    return GENERATION_BUDGET_SECONDS - (time.monotonic() - started)
+    """Сколько секунд осталось у этого роутера."""
+    return PROVIDER_BUDGET_SECONDS - (time.monotonic() - started)
 
 
 def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[str, str]:
@@ -696,23 +710,43 @@ def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[s
                 last_error = exc
                 log(f"{provider.name}/{model}: ошибка — {exc}")
 
+                # Пустой текст от модели детерминирован: повтор того же
+                # запроса даст то же самое. Не тратим на него время,
+                # а сразу пробуем следующую модель или короткий промпт.
+                if "пустой текст" in str(exc):
+                    break
+
                 if not exc.retryable:
                     break  # модель недоступна — сразу берём следующую
+
+                # Бюджет роутера исчерпан — не затягиваем job.
+                if _remaining(started) <= 1:
+                    log(f"{provider.name}: бюджет времени исчерпан — перехожу к следующему роутеру")
+                    raise ProviderError(
+                        f"{provider.name}: не уложился в {PROVIDER_BUDGET_SECONDS} с. "
+                        f"Последняя ошибка: {last_error}"
+                    )
 
                 # API может сам сказать, сколько ждать (HTTP 429).
                 if exc.retry_after is not None:
                     if exc.retry_after > MAX_RETRY_WAIT:
-                        # Это не короткий рейт-лимит, а дневная квота.
-                        # Ждать её бессмысленно — сразу берём другую модель.
-                        log(
-                            f"{provider.name}/{model}: лимит исчерпан надолго "
-                            f"({exc.retry_after / 3600:.1f} ч) — перехожу к другой модели"
-                        )
+                        # Дневная квота или другой долгий лимит — не ждём.
+                        hours = exc.retry_after / 3600
+                        if hours >= 1:
+                            log(
+                                f"{provider.name}/{model}: лимит исчерпан надолго "
+                                f"({hours:.1f} ч) — перехожу к другой модели"
+                            )
+                        else:
+                            log(
+                                f"{provider.name}/{model}: просят подождать "
+                                f"{exc.retry_after:.0f} с — слишком долго, беру другую модель"
+                            )
                         break
                     if exc.retry_after > _remaining(started):
                         log(
-                            f"{provider.name}/{model}: просят подождать "
-                            f"{exc.retry_after:.0f} с — дольше бюджета, беру другую модель"
+                            f"{provider.name}/{model}: ожидание {exc.retry_after:.0f} с "
+                            f"не влезает в бюджет — беру другую модель"
                         )
                         break
                     log(f"{provider.name}/{model}: жду {exc.retry_after:.0f} с (просит API)")
