@@ -51,6 +51,9 @@ RETRY_DELAYS = (5, 20)         # паузы между повторами вну
 GENERATION_BUDGET_SECONDS = 300
 MAX_GENERATION_ATTEMPTS = 3    # сколько раз просить пост у одного провайдера
 MAX_RETRY_WAIT = 60            # максимум секунд ожидания по Retry-After
+# Запас токенов: reasoning-модели тратят часть бюджета на скрытые
+# размышления, поэтому 700 не хватало и приходил пустой content.
+MAX_TOKENS = 1500
 RECENT_KEEP = 20               # сколько последних постов хранить в state
 DEDUP_THRESHOLD = 0.75         # схожесть шинглов, выше — дубликат
 
@@ -98,28 +101,83 @@ GEMINI_MODELS = (
     "gemini-2.5-flash-lite",
 )
 
-SYSTEM_PROMPT = (
-    "Ты — автор Telegram-канала без узкой тематики. Ты пишешь живые, "
-    "интересные и оригинальные короткие посты на русском языке.\n"
+# Два варианта промпта — под разные типы моделей.
+#
+# ПОЧЕМУ ДВА. Reasoning-модели (например gpt-oss-20b у Pollinations) тратят
+# бюджет токенов на скрытое поле "reasoning". Проверено на практике: длинный
+# подробный промпт заставлял модель размышлять так долго, что на сам пост
+# не оставалось токенов и приходил пустой content. Короткий промпт решает это:
+# reasoning падает с ~4900 до ~250 символов, пост появляется.
+PROMPT_STYLES = ("full", "compact")
+
+SYSTEM_PROMPT_FULL = (
+    "Ты пишешь короткие посты в Telegram-канал. Жанр — абсурдный юмор.\n"
     "\n"
-    "Требования к ответу:\n"
-    "1. Верни ТОЛЬКО текст поста — от первого сообщения до последнего.\n"
-    "2. Никаких пояснений, вступлений, заголовков, подписей и комментариев "
-    "от себя. Не пиши «Вот пост», «Конечно», «Надеюсь, понравилось».\n"
-    "3. Не используй markdown: без символов #, *, _, `, без блоков кода.\n"
-    "4. Объём — от 2 до 5 предложений, не больше 700 символов.\n"
-    "5. Пиши естественным человеческим языком, без канцелярита и без "
-    "шаблонных вступлений вроде «В современном мире».\n"
-    "6. Не задавай вопросов читателю в конце и не призывай ставить лайки.\n"
-    "7. Не упоминай, что текст написан ИИ.\n"
-    "8. Можно использовать эмодзи, но не больше двух на весь пост.\n"
+    "ГЛАВНАЯ ЗАДАЧА: рассмешить. Не заставить задуматься, не поддержать, "
+    "не поделиться мудростью — а рассмешить.\n"
+    "\n"
+    "ЗАПРЕЩЕНО (это самая частая ошибка, не делай так):\n"
+    "- философствовать и рассуждать о жизни, времени, людях «в целом»;\n"
+    "- мораль и вывод в конце. Никаких «и вот что я понял», «может, в этом "
+    "и смысл», «мы всю жизнь учимся, чтобы...», «зато теперь я знаю»;\n"
+    "- красивые метафоры и поэтичность: шёпот капель, сумрачный ковёр, "
+    "время замедлило ритм, танец теней — всё это в мусор;\n"
+    "- делиться чувствами автора и рефлексировать;\n"
+    "- начинать с обобщения («В современном мире...», «Все мы...»);\n"
+    "- слова «мудрость», «смысл», «гармония», «ирония судьбы».\n"
+    "\n"
+    "КАК НАДО:\n"
+    "- придумай ОДНУ конкретную нелепую сцену: кто-то что-то делает, "
+    "и это абсурдно;\n"
+    "- конкретные предметы и детали вместо абстракций: консервная банка, "
+    "сосед, тапок, бухгалтерия, насос, кот, очередь;\n"
+    "- серьёзный спокойный тон, будто всё так и должно быть. Абсурд плюс "
+    "невозмутимость — смешно. Абсурд плюс философия — скучно;\n"
+    "- неожиданный поворот в конце, а не мораль;\n"
+    "- преувеличение разрешено и приветствуется.\n"
+    "\n"
+    "ПРИМЕРЫ ПРАВИЛЬНОГО СТИЛЯ (не копируй их, придумай своё):\n"
+    "«Сосед сверлит стену ровно с 9 до 18 с перерывом на обед. Я уже "
+    "подстроил под него рабочий день. Кажется, он мой начальник.»\n"
+    "«Купил абонемент в спортзал. Хожу мимо него каждое утро и чувствую, "
+    "как мы оба становимся сильнее.»\n"
+    "«В подъезде повесили объявление, что лифт не работает по техническим "
+    "причинам. Лифт висит рядом. Никто не объясняет, кто кого ремонтирует.»\n"
+    "\n"
+    "ФОРМАТ ОТВЕТА:\n"
+    "1. Верни ТОЛЬКО текст поста — от первого слова до последнего.\n"
+    "2. Никаких пояснений, вступлений и подписей. Не пиши «Вот пост», "
+    "«Конечно», «Надеюсь, понравилось».\n"
+    "3. Без markdown: ни #, ни *, ни _, ни `, без блоков кода.\n"
+    "4. От 2 до 5 предложений, не больше 700 символов.\n"
+    "5. Эмодзи — максимум один, лучше вообще без них.\n"
+    "6. Не упоминай, что текст написал ИИ.\n"
 )
 
-USER_PROMPT = (
-    "Напиши один новый оригинальный пост. Сам выбери тему и форму: "
-    "наблюдение из жизни, короткая история, неожиданный факт, мысль вслух, "
-    "лёгкий юмор или абсурд. Только текст поста, без пояснений."
+# Короткий вариант: для моделей, которые много «думают» перед ответом.
+SYSTEM_PROMPT_COMPACT = (
+    "Пиши абсурдные шутки для Telegram. Только текст, 2-5 предложений, "
+    "без markdown. Без философии, морали и красивых метафор. Одна нелепая "
+    "бытовая сцена, серьёзный тон, неожиданный поворот в конце."
 )
+
+SYSTEM_PROMPT = SYSTEM_PROMPT_FULL  # для совместимости с тестами
+
+USER_PROMPT_FULL = (
+    "Придумай один новый абсурдный пост. Возьми обычную бытовую ситуацию и "
+    "выверни её так, чтобы стало смешно: нелепая деталь, неожиданный поворот, "
+    "серьёзный тон про глупость. Только текст поста, без пояснений."
+)
+
+USER_PROMPT_COMPACT = "Придумай один абсурдный пост. Только текст."
+
+
+def system_prompt(style: str) -> str:
+    return SYSTEM_PROMPT_COMPACT if style == "compact" else SYSTEM_PROMPT_FULL
+
+
+def user_prompt(style: str) -> str:
+    return USER_PROMPT_COMPACT if style == "compact" else USER_PROMPT_FULL
 
 
 class BotError(RuntimeError):
@@ -187,7 +245,9 @@ def http_json(
         retry_after = _parse_retry_after(exc.headers.get("Retry-After"), body)
         raise ProviderError(
             f"HTTP {exc.code} {exc.reason} — {_short(body, 600)}",
-            retryable=exc.code in (408, 409, 425, 429, 500, 502, 503, 504),
+            # 402 добавлен намеренно: Pollinations отдаёт его как «Free limit
+            # reached, retry after N seconds», то есть это лимит, а не оплата.
+            retryable=exc.code in (402, 408, 409, 425, 429, 500, 502, 503, 504),
             retry_after=retry_after,
         ) from exc
     except urllib.error.URLError as exc:
@@ -217,28 +277,49 @@ def _short(text: str, limit: int) -> str:
 def _parse_retry_after(header: str | None, body: str) -> float | None:
     """Сколько секунд просит подождать API.
 
-    Берём из заголовка Retry-After, а если его нет — из текста ошибки вида
-    «Rate limit exceeded. Retry after 14 seconds». Больше MAX_RETRY_WAIT не ждём.
+    Ищем в трёх местах по порядку надёжности:
+      1. JSON-поле "retry_after" в теле ответа;
+      2. заголовок Retry-After;
+      3. текст вида «Retry after 14 seconds».
+    Возвращаем как есть (без обрезки) — решение, ждать или пропустить,
+    принимает вызывающий код.
     """
     candidates: list[float] = []
 
-    if header:
-        try:
-            candidates.append(float(str(header).strip()))
-        except (TypeError, ValueError):
-            pass
-
     if body:
-        match = re.search(r"retry[_ -]?after[\"'\s:]*(\d+(?:\.\d+)?)", body, re.IGNORECASE)
+        # 1) JSON-поле retry_after — самый точный вариант.
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict) and "retry_after" in error:
+                try:
+                    candidates.append(float(error["retry_after"]))
+                except (TypeError, ValueError):
+                    pass
+
+        # 3) Текст «Retry after 14 seconds».
+        match = re.search(
+            r"retry[_ -]?after[\"'\s:]*(\d+(?:\.\d+)?)", body, re.IGNORECASE
+        )
         if match:
             try:
                 candidates.append(float(match.group(1)))
             except ValueError:
                 pass
 
+    # 2) Заголовок Retry-After (может быть и датой — тогда игнорируем).
+    if header:
+        try:
+            candidates.append(float(str(header).strip()))
+        except (TypeError, ValueError):
+            pass
+
     if not candidates:
         return None
-    return max(0.0, min(max(candidates), MAX_RETRY_WAIT))
+    return max(0.0, max(candidates))
 
 
 # --------------------------------------------------------------------------
@@ -452,16 +533,21 @@ def remember(state: dict, text: str, provider: str, model: str) -> None:
 # Провайдеры ИИ
 # --------------------------------------------------------------------------
 
-def build_payload(model: str, extra_note: str = "") -> dict:
-    user_prompt = USER_PROMPT + extra_note
+def build_payload(model: str, extra_note: str = "", style: str = "full") -> dict:
+    """Собрать тело запроса.
+
+    style="full"    — подробный промпт, лучшее качество;
+    style="compact" — короткий промпт для reasoning-моделей, которые иначе
+                      тратят весь бюджет токенов на скрытые размышления.
+    """
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": system_prompt(style)},
+            {"role": "user", "content": user_prompt(style) + extra_note},
         ],
         "temperature": 1.0,
-        "max_tokens": 700,
+        "max_tokens": MAX_TOKENS,
     }
 
 
@@ -494,8 +580,13 @@ def extract_text(response: dict) -> str:
         )
     if not isinstance(content, str) or not content.strip():
         finish = first.get("finish_reason") or message.get("finish_reason") or "?"
+        had_reasoning = bool(str(message.get("reasoning") or "").strip())
+        hint = " — модель ушла в размышления" if had_reasoning else ""
+        # Помечаем как временную: иногда помогает другой промпт или повтор.
+        # Бесконечный цикл исключён — в generate_from есть счётчик попыток.
         raise ProviderError(
-            f"Модель вернула пустой текст (finish_reason={finish})", retryable=False
+            f"Модель вернула пустой текст (finish_reason={finish}{hint})",
+            retryable=True,
         )
     return content
 
@@ -580,8 +671,13 @@ def _remaining(started: float) -> float:
     return GENERATION_BUDGET_SECONDS - (time.monotonic() - started)
 
 
-def generate_from(provider: Endpoint, note: str) -> tuple[str, str]:
-    """Перебрать модели одного роутера. Вернуть (текст, имя модели)."""
+def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[str, str]:
+    """Перебрать модели одного роутера. Вернуть (текст, имя модели).
+
+    Начинаем с подробного промпта. Если модель вернула пустой content
+    (типично для reasoning-моделей, потративших бюджет на размышления),
+    повторяем те же модели с коротким промптом.
+    """
     headers = provider.headers()
     last_error: Exception | None = None
     started = time.monotonic()
@@ -592,7 +688,9 @@ def generate_from(provider: Endpoint, note: str) -> tuple[str, str]:
         attempt = 0
         while True:
             try:
-                response = http_json(provider.url, build_payload(model, note), headers)
+                response = http_json(
+                    provider.url, build_payload(model, note, style), headers
+                )
                 return extract_text(response), model
             except ProviderError as exc:
                 last_error = exc
@@ -603,10 +701,18 @@ def generate_from(provider: Endpoint, note: str) -> tuple[str, str]:
 
                 # API может сам сказать, сколько ждать (HTTP 429).
                 if exc.retry_after is not None:
+                    if exc.retry_after > MAX_RETRY_WAIT:
+                        # Это не короткий рейт-лимит, а дневная квота.
+                        # Ждать её бессмысленно — сразу берём другую модель.
+                        log(
+                            f"{provider.name}/{model}: лимит исчерпан надолго "
+                            f"({exc.retry_after / 3600:.1f} ч) — перехожу к другой модели"
+                        )
+                        break
                     if exc.retry_after > _remaining(started):
                         log(
                             f"{provider.name}/{model}: просят подождать "
-                            f"{exc.retry_after:.0f} с — это дольше бюджета, беру другую модель"
+                            f"{exc.retry_after:.0f} с — дольше бюджета, беру другую модель"
                         )
                         break
                     log(f"{provider.name}/{model}: жду {exc.retry_after:.0f} с (просит API)")
@@ -620,6 +726,14 @@ def generate_from(provider: Endpoint, note: str) -> tuple[str, str]:
                     time.sleep(delay)
                     continue
                 break
+
+    # Все модели исчерпаны на подробном промпте — пробуем короткий.
+    if style == "full":
+        log(f"{provider.name}: перехожу на короткий промпт (меньше размышлений)")
+        try:
+            return generate_from(provider, note, style="compact")
+        except ProviderError:
+            pass
 
     raise ProviderError(f"{provider.name}: ни одна модель не ответила. Последняя ошибка: {last_error}")
 

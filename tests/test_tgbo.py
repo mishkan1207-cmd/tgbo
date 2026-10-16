@@ -282,6 +282,38 @@ class TestProviderSelection(unittest.TestCase):
         self.assertNotIn("orca-only-model", llm7.model_list())
 
 
+class TestPromptStyles(unittest.TestCase):
+    """Промпт должен требовать абсурд и запрещать философию."""
+
+    def test_full_prompt_forbids_philosophy(self):
+        text = tgbo.system_prompt("full").lower()
+        for word in ("философ", "мораль", "абсурд", "рассмешить"):
+            with self.subTest(word=word):
+                self.assertIn(word, text)
+
+    def test_compact_prompt_is_short(self):
+        """Короткий промпт нужен, чтобы reasoning-модели не тратили бюджет."""
+        self.assertLess(len(tgbo.system_prompt("compact")), 400)
+
+    def test_compact_prompt_still_forbids_philosophy(self):
+        text = tgbo.system_prompt("compact").lower()
+        self.assertIn("абсурд", text)
+        self.assertIn("философ", text)
+
+    def test_unknown_style_falls_back_to_full(self):
+        self.assertEqual(tgbo.system_prompt("чепуха"), tgbo.SYSTEM_PROMPT_FULL)
+
+    def test_payload_uses_requested_style(self):
+        full = tgbo.build_payload("m", style="full")["messages"][0]["content"]
+        compact = tgbo.build_payload("m", style="compact")["messages"][0]["content"]
+        self.assertNotEqual(full, compact)
+        self.assertLess(len(compact), len(full))
+
+    def test_payload_has_enough_tokens_for_reasoning_models(self):
+        """700 токенов не хватало: reasoning съедал бюджет и content был пуст."""
+        self.assertGreaterEqual(tgbo.build_payload("m")["max_tokens"], 1200)
+
+
 class TestRetryAfter(unittest.TestCase):
     def test_reads_header(self):
         self.assertEqual(tgbo._parse_retry_after("14", ""), 14.0)
@@ -295,8 +327,25 @@ class TestRetryAfter(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(tgbo._parse_retry_after(None, text), 7.0)
 
-    def test_capped_at_maximum(self):
-        self.assertEqual(tgbo._parse_retry_after("9999", ""), float(tgbo.MAX_RETRY_WAIT))
+    def test_reads_json_field_first(self):
+        """Поле retry_after в JSON — самый точный источник."""
+        body = json.dumps({"error": {"code": "quota_exceeded", "retry_after": 62701}})
+        self.assertEqual(tgbo._parse_retry_after(None, body), 62701.0)
+
+    def test_long_quota_is_reported_uncapped(self):
+        """Дневную квоту не обрезаем: по её величине решаем пропустить модель."""
+        body = json.dumps({"error": {"retry_after": 62701}})
+        value = tgbo._parse_retry_after(None, body)
+        self.assertEqual(value, 62701.0)
+        self.assertGreater(value, tgbo.MAX_RETRY_WAIT)
+
+    def test_header_wins_when_larger(self):
+        self.assertEqual(tgbo._parse_retry_after("30", "Retry after 5 seconds"), 30.0)
+
+    def test_short_limit_is_below_threshold(self):
+        """Короткий рейт-лимит должен быть меньше порога ожидания."""
+        value = tgbo._parse_retry_after("14", "")
+        self.assertLessEqual(value, tgbo.MAX_RETRY_WAIT)
 
     def test_none_when_absent(self):
         self.assertIsNone(tgbo._parse_retry_after(None, "no hint here"))
@@ -371,7 +420,7 @@ class TestModuleSafety(unittest.TestCase):
         import inspect
 
         params = list(inspect.signature(tgbo.build_payload).parameters)
-        self.assertEqual(params, ["model", "extra_note"])
+        self.assertEqual(params, ["model", "extra_note", "style"])
 
 
 if __name__ == "__main__":
