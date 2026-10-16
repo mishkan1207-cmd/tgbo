@@ -77,7 +77,24 @@ DEDUP_THRESHOLD = 0.75         # схожесть шинглов, выше — �
 # Порядок: сначала самый стабильный и качественный, дальше — резервы.
 # Все они OpenAI-совместимы, поэтому код запроса одинаковый.
 
-# 1) LLM7.io — бесплатный роутер, работает вообще БЕЗ ключа.
+# 1) Mistral — бесплатный тариф, даёт нормальный русский и главное
+#    НЕ тратит токены на скрытые размышления (reasoning_tokens = 0).
+#    Требуется ключ MISTRAL_API_KEY (console.mistral.ai, без карты).
+#    ВАЖНО: набор моделей зависит от тарифа. Проверено на бесплатном:
+#      ministral-8b-latest   — работает
+#      open-mistral-nemo     — работает
+#      mistral-small-latest  — отвечает 429 «Rate limit exceeded» (платная)
+#    Поэтому дешёвые/бесплатные модели стоят первыми, а более крупные — после:
+#    если тариф изменится, бот просто подхватит следующую.
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_MODELS = (
+    "ministral-8b-latest",
+    "open-mistral-nemo",
+    "ministral-3b-latest",
+    "mistral-small-latest",
+)
+
+# 2) LLM7.io — бесплатный роутер, работает вообще БЕЗ ключа.
 #    Проверено: отвечает, понимает русский.
 #    ВАЖНО про лимиты (проверено на практике):
 #      * у каждой модели СВОЯ дневная квота токенов;
@@ -85,7 +102,6 @@ DEDUP_THRESHOLD = 0.75         # схожесть шинглов, выше — �
 #      * при исчерпании API отвечает 429 и «Retry after 88000 seconds».
 #    Поэтому модели перебираются по порядку, а долгое ожидание не соблюдается —
 #    бот сразу берёт следующую модель.
-#    DeepSeek-V4-Flash-0731 стоит первым: он стабильнее прочих отдаёт текст.
 LLM7_URL = "https://api.llm7.io/v1/chat/completions"
 LLM7_MODELS = (
     "DeepSeek-V4-Flash-0731",
@@ -95,9 +111,10 @@ LLM7_MODELS = (
     "codestral-latest",
 )
 
-# 2) Pollinations — тоже без ключа, но у него серьёзные ограничения:
-#    лимит «1 ответ в 30 секунд на IP» и КЭШИРОВАНИЕ ответов (два разных
-#    запроса вернули побитово одинаковый текст). Поэтому он только резерв.
+# 3) Pollinations — тоже без ключа, но у него серьёзные ограничения:
+#    лимит «1 ответ в 30 секунд на IP», КЭШИРОВАНИЕ ответов (два разных
+#    запроса вернули побитово одинаковый текст) и reasoning-модель, которая
+#    часто отдаёт пустой content. Поэтому он только последний резерв.
 POLLINATIONS_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_MODELS = ("openai",)
 
@@ -767,6 +784,10 @@ class Endpoint:
 
 
 PROVIDERS = (
+    # Mistral первым: со своим ключом он самый предсказуемый и не тратит
+    # токены на reasoning. Без ключа просто не подключается.
+    Endpoint("Mistral", MISTRAL_URL, MISTRAL_MODELS,
+             key_env=("MISTRAL_API_KEY",), model_env="MISTRAL_MODEL"),
     Endpoint("LLM7", LLM7_URL, LLM7_MODELS, model_env="AI_MODEL"),
     Endpoint("Pollinations", POLLINATIONS_URL, POLLINATIONS_MODELS),
     Endpoint("OrcaRouter", ORCA_URL, ORCA_MODELS, key_env=("ORCA_API_KEY",),
@@ -917,15 +938,30 @@ def provider_order() -> list[Endpoint]:
     requested = (os.getenv("AI_PROVIDER") or "auto").strip().lower()
     named = {p.name.lower(): p for p in PROVIDERS}
 
-    if requested in ("llm7", "pollinations", "orcarouter", "orca", "gemini", "google"):
-        alias = {"orca": "orcarouter", "google": "gemini"}.get(requested, requested)
-        chosen = named[alias]
+    aliases = {
+        "orca": "orcarouter",
+        "google": "gemini",
+        "llm7.io": "llm7",
+    }
+    known = set(named) | set(aliases)
+
+    if requested in ("auto", ""):
+        # auto: все доступные роутеры по порядку приоритета.
+        return [p for p in PROVIDERS if p.available()]
+
+    if requested in known:
+        chosen = named[aliases.get(requested, requested)]
+        # Явно выбранный роутер с ключом, которого нет, — это ошибка
+        # конфигурации, о ней лучше сказать прямо.
+        if chosen.key_env and not chosen.available():
+            log(
+                f"AI_PROVIDER={requested}, но не задан ключ "
+                f"({', '.join(chosen.key_env)}) — перехожу на auto"
+            )
+            return [p for p in PROVIDERS if p.available()]
         return [chosen]
 
-    if requested not in ("auto", ""):
-        log(f"Неизвестный AI_PROVIDER={requested!r}; использую auto")
-
-    # auto: все доступные роутеры по порядку приоритета.
+    log(f"Неизвестный AI_PROVIDER={requested!r}; использую auto")
     return [p for p in PROVIDERS if p.available()]
 
 

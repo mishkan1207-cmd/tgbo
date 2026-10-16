@@ -228,7 +228,8 @@ class TestResponseSanitising(unittest.TestCase):
 class TestProviderSelection(unittest.TestCase):
     def setUp(self):
         self.saved = dict(os.environ)
-        for name in ("AI_PROVIDER", "AI_MODEL", "ORCA_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        for name in ("AI_PROVIDER", "AI_MODEL", "MISTRAL_API_KEY", "ORCA_API_KEY",
+                     "GEMINI_API_KEY", "GOOGLE_API_KEY"):
             os.environ.pop(name, None)
 
     def tearDown(self):
@@ -238,12 +239,19 @@ class TestProviderSelection(unittest.TestCase):
     def names(self):
         return [p.name for p in tgbo.provider_order()]
 
-    def test_auto_starts_with_llm7(self):
-        """LLM7 работает без ключа, поэтому всегда первый."""
-        self.assertEqual(self.names()[0], "LLM7")
+    def test_mistral_is_first_when_key_present(self):
+        """Mistral со своим ключом — основной: он не тратит токены на reasoning."""
+        os.environ["MISTRAL_API_KEY"] = "test-key"
+        self.assertEqual(self.names()[0], "Mistral")
 
-    def test_auto_includes_pollinations(self):
-        self.assertIn("Pollinations", self.names())
+    def test_mistral_hidden_without_key(self):
+        self.assertNotIn("Mistral", self.names())
+
+    def test_keyless_routers_always_available(self):
+        """LLM7 и Pollinations работают без ключа и присутствуют всегда."""
+        names = self.names()
+        self.assertIn("LLM7", names)
+        self.assertIn("Pollinations", names)
 
     def test_optional_providers_hidden_without_key(self):
         names = self.names()
@@ -258,12 +266,27 @@ class TestProviderSelection(unittest.TestCase):
         self.assertIn("Gemini", names)
 
     def test_explicit_provider_selection(self):
-        os.environ["AI_PROVIDER"] = "gemini"
-        self.assertEqual(self.names(), ["Gemini"])
-        os.environ["AI_PROVIDER"] = "llm7"
-        self.assertEqual(self.names(), ["LLM7"])
-        os.environ["AI_PROVIDER"] = "orca"
-        self.assertEqual(self.names(), ["OrcaRouter"])
+        os.environ["MISTRAL_API_KEY"] = "test-key"
+        os.environ["ORCA_API_KEY"] = "test-key"
+        os.environ["GEMINI_API_KEY"] = "test-key"
+        for requested, expected in (
+            ("mistral", "Mistral"),
+            ("llm7", "LLM7"),
+            ("pollinations", "Pollinations"),
+            ("gemini", "Gemini"),
+            ("google", "Gemini"),      # алиас
+            ("orca", "OrcaRouter"),    # алиас
+        ):
+            with self.subTest(requested=requested):
+                os.environ["AI_PROVIDER"] = requested
+                self.assertEqual(self.names(), [expected])
+
+    def test_explicit_provider_without_key_falls_back_to_auto(self):
+        """Выбрали Mistral, но ключа нет — работаем на том, что доступно."""
+        os.environ["AI_PROVIDER"] = "mistral"
+        names = self.names()
+        self.assertNotIn("Mistral", names)
+        self.assertEqual(names[0], "LLM7")
 
     def test_unknown_provider_falls_back_to_auto(self):
         os.environ["AI_PROVIDER"] = "чепуха"
@@ -281,10 +304,15 @@ class TestProviderSelection(unittest.TestCase):
         self.assertEqual(llm7.model_list(), ["model-one", "model-two"])
 
     def test_model_env_is_not_leaked_between_providers(self):
-        """ORCA_MODEL не должен влиять на LLM7 и наоборот."""
-        os.environ["ORCA_MODEL"] = "orca-only-model"
+        """MISTRAL_MODEL не должен влиять на LLM7 и наоборот."""
+        os.environ["MISTRAL_MODEL"] = "mistral-only-model"
         llm7 = next(p for p in tgbo.PROVIDERS if p.name == "LLM7")
-        self.assertNotIn("orca-only-model", llm7.model_list())
+        self.assertNotIn("mistral-only-model", llm7.model_list())
+
+    def test_mistral_models_avoid_paid_only_ones_first(self):
+        """На бесплатном тарифе mistral-small отдаёт 429 — он не первый."""
+        mistral = next(p for p in tgbo.PROVIDERS if p.name == "Mistral")
+        self.assertNotEqual(mistral.model_list()[0], "mistral-small-latest")
 
 
 class TestPromptStyles(unittest.TestCase):

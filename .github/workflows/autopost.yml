@@ -50,11 +50,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # auto: цепочка бесплатных роутеров по порядку.
-  #   1. LLM7.io        — бесплатно, БЕЗ ключа (основной)
-  #   2. Pollinations   — бесплатно, без ключа (резерв)
-  #   3. OrcaRouter     — только если ORCA_API_KEY задан и модели разрешены
-  #   4. Gemini         — только если задан GEMINI_API_KEY
+  # auto: цепочка роутеров по порядку.
+  #   1. Mistral      — основной, если задан MISTRAL_API_KEY (бесплатно, без карты).
+  #                     Не тратит токены на reasoning, нормальный русский.
+  #   2. LLM7.io      — бесплатно, БЕЗ ключа (резерв)
+  #   3. Pollinations — бесплатно, без ключа (последний резерв)
+  #   4. OrcaRouter / Gemini — только если их ключи рабочие
   # Если один роутер недоступен, бот сам переходит к следующему.
   AI_PROVIDER: "auto"
   PYTHONUNBUFFERED: "1"
@@ -110,6 +111,7 @@ jobs:
           INPUT_CUSTOM_PROMPT: ${{ inputs.custom_prompt }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
           AI_MODEL: ${{ vars.AI_MODEL }}
