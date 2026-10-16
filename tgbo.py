@@ -42,7 +42,10 @@ from datetime import datetime, timezone
 # --------------------------------------------------------------------------
 
 TELEGRAM_LIMIT = 4096          # жёсткий лимит Telegram на длину сообщения
-MAX_POST_CHARS = 1200          # наш собственный лимит: пост должен быть коротким
+# 700 — столько же, сколько просит промпт («не больше 700 символов»).
+# Раньше здесь стояло 1200: ответ на 800 символов проходил проверку,
+# хотя промпт его запрещал. Теперь лимиты согласованы.
+MAX_POST_CHARS = 700
 MIN_POST_CHARS = 80            # меньше — считаем ответ мусором
 HTTP_TIMEOUT = 60              # секунд на один HTTP-запрос
 # Всё время на генерацию. Защита от того, что медленный провайдер съест
@@ -56,6 +59,10 @@ MAX_GENERATION_ATTEMPTS = 3    # сколько раз просить пост �
 # 35 с выбрано так, чтобы уложиться в лимит Pollinations («1 ответ в 30 с»),
 # но сразу отсечь дневную квоту LLM7 («Retry after 88000 seconds»).
 MAX_RETRY_WAIT = 35
+# Сколько раз подряд уважать короткий Retry-After для одной модели.
+# Без этого ограничения модель, отвечающая «подожди 3 секунды» бесконечно,
+# получала бы запрос за запросом весь бюджет роутера.
+MAX_QUOTA_WAITS = 3
 # Паузы между повторами внутри одной модели: короткие, чтобы не тянуть job.
 RETRY_DELAYS = (3, 8)
 # Запас токенов: reasoning-модели тратят часть бюджета на скрытые
@@ -198,7 +205,17 @@ class BotError(RuntimeError):
 
 
 class ProviderError(BotError):
-    """Провайдер недоступен или отверг запрос."""
+    """Провайдер недоступен или отверг запрос.
+
+    reason — машиночитаемая причина, чтобы вызывающий код не разбирал текст:
+      "no_access"   — ключу/аккаунту не разрешена модель (401/403/404);
+                      бессмысленно пробовать и остальные модели этого роутера;
+      "empty"       — модель ответила, но текста нет (например ушла в reasoning);
+      "rate_limit"  — сработал лимит;
+      "server"      — ошибка на стороне провайдера (5xx);
+      "network"     — сеть/таймаут;
+      "bad_request" — запрос неверный, повтор не поможет.
+    """
 
     def __init__(
         self,
@@ -206,12 +223,14 @@ class ProviderError(BotError):
         *,
         retryable: bool = True,
         retry_after: float | None = None,
+        reason: str = "unknown",
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         # Если API сам сказал, сколько ждать (HTTP 429 + Retry-After),
         # ждём ровно столько, а не наугад.
         self.retry_after = retry_after
+        self.reason = reason
 
 
 def log(message: str) -> None:
@@ -256,29 +275,63 @@ def http_json(
             pass
 
         retry_after = _parse_retry_after(exc.headers.get("Retry-After"), body)
+        retryable, reason = _classify_http_error(exc.code)
         raise ProviderError(
             f"HTTP {exc.code} {exc.reason} — {_short(body, 600)}",
-            # 402 добавлен намеренно: Pollinations отдаёт его как «Free limit
-            # reached, retry after N seconds», то есть это лимит, а не оплата.
-            retryable=exc.code in (402, 408, 409, 425, 429, 500, 502, 503, 504),
+            retryable=retryable,
             retry_after=retry_after,
+            reason=reason,
         ) from exc
     except urllib.error.URLError as exc:
-        raise ProviderError(f"Сеть недоступна: {exc.reason}") from exc
+        raise ProviderError(
+            f"Сеть недоступна: {exc.reason}", reason="network"
+        ) from exc
     except TimeoutError as exc:
-        raise ProviderError("Превышено время ожидания ответа API") from exc
+        raise ProviderError(
+            "Превышено время ожидания ответа API", reason="network"
+        ) from exc
 
     if not raw.strip():
-        raise ProviderError("API вернул пустой ответ", retryable=False)
+        raise ProviderError("API вернул пустой ответ", retryable=False, reason="empty")
 
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ProviderError(f"API вернул не JSON: {_short(raw, 300)}", retryable=False) from exc
+        raise ProviderError(
+            f"API вернул не JSON: {_short(raw, 300)}",
+            retryable=False,
+            reason="bad_response",
+        ) from exc
 
     if not isinstance(parsed, dict):
-        raise ProviderError("Неожиданный формат ответа API", retryable=False)
+        raise ProviderError(
+            "Неожиданный формат ответа API", retryable=False, reason="bad_response"
+        )
     return parsed
+
+
+def _classify_http_error(code: int) -> tuple[bool, str]:
+    """Разделить временные ошибки от постоянных.
+
+    Возвращает (стоит_ли_повторять, причина). Смысл разделения: постоянные
+    ошибки не надо долбить повторами — это только жжёт время и лимиты.
+    """
+    if code in (401, 403, 404):
+        # Ключ не пускает к модели / модели нет. Повтор не поможет,
+        # и остальные модели этого роутера, скорее всего, тоже закрыты.
+        return False, "no_access"
+    if code == 400:
+        return False, "bad_request"
+    if code == 402:
+        # Pollinations отдаёт 402 как «Free limit reached, retry after N s».
+        return True, "rate_limit"
+    if code == 429:
+        return True, "rate_limit"
+    if code in (408, 409, 425):
+        return True, "server"
+    if 500 <= code < 600:
+        return True, "server"
+    return False, "unknown"
 
 
 def _short(text: str, limit: int) -> str:
@@ -365,19 +418,53 @@ _TAIL_RE = re.compile(
     r"как\s+вам\b[^\n]{0,60}\?|что\s+думаете\b[^\n]{0,60}\?)\s*$",
     re.IGNORECASE,
 )
-_EMOJI_RE = re.compile(
-    "[\U0001f300-\U0001faff\U00002700-\U000027bf\U0001f1e6-\U0001f1ff\U00002600-\U000026ff]"
+# Эмодзи как ПОСЛЕДОВАТЕЛЬНОСТИ, а не отдельные символы.
+# Важно: 👨👩👧, флаги и эмодзи с тоном кожи состоят из нескольких
+# code point'ов. Если резать по символам, от них остаются обрывки.
+_EMOJI_CHAR = (
+    "[\U0001f300-\U0001faff"
+    "\U00002700-\U000027bf"
+    "\U0001f1e6-\U0001f1ff"
+    "\U00002600-\U000026ff"
+    "\U0001f000-\U0001f2ff"
+    "\U0000fe0f"             # variation selector
+    "\U000020e3"             # combining enclosing keycap
+    "]"
 )
-MAX_EMOJI = 2                  # больше — выглядит как спам
+_EMOJI_MODIFIER = "[\U0001f3fb-\U0001f3ff\U0000fe0f\U000020e3]"
+# Флаги — это ПАРА региональных индикаторов (🇷 + 🇺 = 🇷🇺). Их надо
+# матчить вместе, иначе от флага остаётся половина.
+# ВНИМАНИЕ: диапазон обязан быть в квадратных скобках. Без них запись
+# \U0001f1e6-\U0001f1ff разбирается неверно: Python читает \U только
+# с восемью hex-цифрами и «съедает» хвост вместе с дефисом.
+_FLAG_RE = "(?:[\U0001f1e6-\U0001f1ff]){2}"
+_EMOJI_SEQ_RE = re.compile(
+    f"{_FLAG_RE}"
+    f"|{_EMOJI_CHAR}(?:{_EMOJI_MODIFIER})*(?:\u200d{_EMOJI_CHAR}(?:{_EMOJI_MODIFIER})*)*"
+)
+MAX_EMOJI = 1                  # промпт разрешает максимум один эмодзи
 
 
 def limit_emoji(text: str, limit: int = MAX_EMOJI) -> str:
-    """Оставить не больше `limit` эмодзи, лишние убрать."""
-    found = list(_EMOJI_RE.finditer(text))
-    if len(found) <= limit:
+    """Оставить не больше `limit` эмодзи.
+
+    Работает с целыми последовательностями: лишние эмодзи удаляются
+    целиком вместе с ZWJ и модификаторами, обрывков не остаётся.
+    """
+    spans = [match.span() for match in _EMOJI_SEQ_RE.finditer(text)]
+    if len(spans) <= limit:
         return text
-    keep = {match.start() for match in found[:limit]}
-    return "".join(ch for i, ch in enumerate(text) if i in keep or not _EMOJI_RE.match(ch))
+
+    keep_until = spans[limit - 1][1] if limit else 0
+    parts: list[str] = []
+    position = 0
+    for start, end in spans:
+        parts.append(text[position:start])
+        if end <= keep_until:
+            parts.append(text[start:end])
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
 
 
 def clean_post(raw: str) -> str:
@@ -521,12 +608,30 @@ def load_state(path: str) -> dict:
 
 
 def save_state(path: str, state: dict) -> None:
+    """Сохранить состояние атомарно.
+
+    Пишем во временный файл рядом и переименовываем. Если процесс убьют
+    посередине записи, старый файл останется целым — JSON не побьётся.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+
+    temp_path = f"{path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)   # атомарная замена
+    except OSError:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
 
 
 def remember(state: dict, text: str, provider: str, model: str) -> None:
@@ -595,11 +700,10 @@ def extract_text(response: dict) -> str:
         finish = first.get("finish_reason") or message.get("finish_reason") or "?"
         had_reasoning = bool(str(message.get("reasoning") or "").strip())
         hint = " — модель ушла в размышления" if had_reasoning else ""
-        # Помечаем как временную: иногда помогает другой промпт или повтор.
-        # Бесконечный цикл исключён — в generate_from есть счётчик попыток.
         raise ProviderError(
             f"Модель вернула пустой текст (finish_reason={finish}{hint})",
             retryable=True,
+            reason="empty",
         )
     return content
 
@@ -608,7 +712,9 @@ class Endpoint:
     """Один роутер бесплатных моделей.
 
     `key_env` — какие переменные окружения искать для ключа. Пустой кортеж
-    означает, что роутер работает без ключа (LLM7, Pollinations).
+    означает, что роутер работает без ключа (LLM7, Pollinations) и доступен
+    всегда. Если key_env задан, роутер подключается только при наличии ключа.
+    `model_env` — имя переменной, которой можно переопределить список моделей.
     """
 
     def __init__(
@@ -618,14 +724,12 @@ class Endpoint:
         models: tuple[str, ...],
         key_env: tuple[str, ...] = (),
         model_env: str = "",
-        optional: bool = False,
     ) -> None:
         self.name = name
         self.url = url
         self.models = models
         self.key_env = key_env
         self.model_env = model_env
-        self.optional = optional
 
     def api_key(self) -> str:
         for name in self.key_env:
@@ -637,8 +741,8 @@ class Endpoint:
     def available(self) -> bool:
         """Можно ли пробовать этот роутер.
 
-        Резервные (optional) роутеры требуют ключ. Основные бесплатные
-        роутеры работают всегда.
+        Роутеры без ключа (LLM7, Pollinations) доступны всегда.
+        Роутеры с ключом — только если ключ реально задан.
         """
         if not self.key_env:
             return True
@@ -666,9 +770,9 @@ PROVIDERS = (
     Endpoint("LLM7", LLM7_URL, LLM7_MODELS, model_env="AI_MODEL"),
     Endpoint("Pollinations", POLLINATIONS_URL, POLLINATIONS_MODELS),
     Endpoint("OrcaRouter", ORCA_URL, ORCA_MODELS, key_env=("ORCA_API_KEY",),
-             model_env="ORCA_MODEL", optional=True),
+             model_env="ORCA_MODEL"),
     Endpoint("Gemini", GEMINI_URL, GEMINI_MODELS,
-             key_env=("GEMINI_API_KEY", "GOOGLE_API_KEY"), optional=True),
+             key_env=("GEMINI_API_KEY", "GOOGLE_API_KEY")),
 )
 
 
@@ -685,22 +789,42 @@ def _remaining(started: float) -> float:
     return PROVIDER_BUDGET_SECONDS - (time.monotonic() - started)
 
 
-def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[str, str]:
+def generate_from(
+    provider: Endpoint,
+    note: str,
+    style: str = "full",
+    deadline: float | None = None,
+) -> tuple[str, str]:
     """Перебрать модели одного роутера. Вернуть (текст, имя модели).
 
     Начинаем с подробного промпта. Если модель вернула пустой content
     (типично для reasoning-моделей, потративших бюджет на размышления),
     повторяем те же модели с коротким промптом.
+
+    Время ограничено двумя дедлайнами: своим (PROVIDER_BUDGET_SECONDS)
+    и общим (`deadline` от create_post).
     """
     headers = provider.headers()
     last_error: Exception | None = None
     started = time.monotonic()
 
+    def out_of_time() -> bool:
+        if _remaining(started) <= 1:
+            return True
+        return deadline is not None and time.monotonic() >= deadline
+
     for model in provider.model_list():
         # Ждать по Retry-After разрешено не дольше бюджета.
         waits = _sleep_plan(started)
         attempt = 0
+        quota_waits = 0
         while True:
+            # Дедлайн проверяем ДО запроса — иначе просроченный бюджет
+            # всё равно делает лишний запрос.
+            if out_of_time():
+                raise ProviderError(
+                    f"{provider.name}: время исчерпано. Последняя ошибка: {last_error}"
+                )
             try:
                 response = http_json(
                     provider.url, build_payload(model, note, style), headers
@@ -713,19 +837,23 @@ def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[s
                 # Пустой текст от модели детерминирован: повтор того же
                 # запроса даст то же самое. Не тратим на него время,
                 # а сразу пробуем следующую модель или короткий промпт.
-                if "пустой текст" in str(exc):
+                if exc.reason == "empty":
                     break
 
-                if not exc.retryable:
-                    break  # модель недоступна — сразу берём следующую
-
-                # Бюджет роутера исчерпан — не затягиваем job.
-                if _remaining(started) <= 1:
-                    log(f"{provider.name}: бюджет времени исчерпан — перехожу к следующему роутеру")
-                    raise ProviderError(
-                        f"{provider.name}: не уложился в {PROVIDER_BUDGET_SECONDS} с. "
-                        f"Последняя ошибка: {last_error}"
+                # Ключу не разрешены модели (401/403/404) — остальные
+                # модели этого роутера почти наверняка закрыты тоже.
+                if exc.reason == "no_access":
+                    log(
+                        f"{provider.name}: доступ к моделям закрыт для этого ключа — "
+                        f"пропускаю роутер целиком"
                     )
+                    raise ProviderError(
+                        f"{provider.name}: нет доступа к моделям. Последняя ошибка: {last_error}",
+                        reason="no_access",
+                    )
+
+                if not exc.retryable:
+                    break  # постоянная ошибка — сразу берём следующую модель
 
                 # API может сам сказать, сколько ждать (HTTP 429).
                 if exc.retry_after is not None:
@@ -743,17 +871,29 @@ def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[s
                                 f"{exc.retry_after:.0f} с — слишком долго, беру другую модель"
                             )
                         break
-                    if exc.retry_after > _remaining(started):
+                    if exc.retry_after > _remaining(started) or out_of_time():
                         log(
                             f"{provider.name}/{model}: ожидание {exc.retry_after:.0f} с "
                             f"не влезает в бюджет — беру другую модель"
                         )
                         break
-                    log(f"{provider.name}/{model}: жду {exc.retry_after:.0f} с (просит API)")
+                    if quota_waits >= MAX_QUOTA_WAITS:
+                        # Модель отвечает лимитом снова и снова — дальше
+                        # ждать бессмысленно, иначе будем долбить API.
+                        log(
+                            f"{provider.name}/{model}: лимит не отпускает "
+                            f"({quota_waits} ожиданий) — беру другую модель"
+                        )
+                        break
+                    quota_waits += 1
+                    log(
+                        f"{provider.name}/{model}: жду {exc.retry_after:.0f} с "
+                        f"(просит API, ожидание {quota_waits} из {MAX_QUOTA_WAITS})"
+                    )
                     time.sleep(exc.retry_after)
                     continue
 
-                if attempt < len(waits):
+                if attempt < len(waits) and not out_of_time():
                     delay = waits[attempt]
                     attempt += 1
                     log(f"{provider.name}/{model}: пауза {delay} с перед повтором {attempt}")
@@ -762,10 +902,10 @@ def generate_from(provider: Endpoint, note: str, style: str = "full") -> tuple[s
                 break
 
     # Все модели исчерпаны на подробном промпте — пробуем короткий.
-    if style == "full":
+    if style == "full" and not (deadline is not None and time.monotonic() >= deadline):
         log(f"{provider.name}: перехожу на короткий промпт (меньше размышлений)")
         try:
-            return generate_from(provider, note, style="compact")
+            return generate_from(provider, note, style="compact", deadline=deadline)
         except ProviderError:
             pass
 
@@ -795,7 +935,12 @@ def create_post(recent: list[dict], enforce_dedup: bool = True) -> tuple[str, st
     `recent` всегда передаётся в промпт, чтобы модель не повторялась.
     Если `enforce_dedup` = False, готовый пост не отбраковывается как
     дубликат (режим "force" из ручного запуска).
+
+    Общее время ограничено GENERATION_BUDGET_SECONDS: как только дедлайн
+    прошёл, новые попытки не начинаются.
     """
+    deadline = time.monotonic() + GENERATION_BUDGET_SECONDS
+
     base_note = ""
     custom = (os.getenv("CUSTOM_PROMPT") or "").strip()
     if custom:
@@ -813,11 +958,19 @@ def create_post(recent: list[dict], enforce_dedup: bool = True) -> tuple[str, st
 
     errors: list[str] = []
     for provider in provider_order():
+        if time.monotonic() >= deadline:
+            errors.append(f"{provider.name}: пропущен, общий лимит времени исчерпан")
+            log("Общий бюджет генерации исчерпан — новые роутеры не пробую")
+            break
+
         note = base_note
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            if time.monotonic() >= deadline:
+                errors.append(f"{provider.name}: пропущен, время вышло")
+                break
             try:
                 log(f"Генерирую пост через {provider.name} (попытка {attempt})")
-                raw, model = generate_from(provider, note)
+                raw, model = generate_from(provider, note, deadline=deadline)
             except ProviderError as exc:
                 errors.append(f"{provider.name}: {exc}")
                 break  # этот роутер исчерпан — переходим к следующему
@@ -946,10 +1099,10 @@ def main() -> int:
     print("-" * 60, flush=True)
 
     if dry_run:
-        log("DRY_RUN=1 — в Telegram ничего не отправлено")
-        remember(state, text, provider, model)
-        save_state(state_path, state)
-        log(f"Состояние обновлено: {state_path}")
+        # Тестовый запуск НИЧЕГО не сохраняет: пост не опубликован, значит
+        # он не должен попадать в историю. Иначе реальный запуск потом
+        # посчитает этот текст уже опубликованным.
+        log("DRY_RUN=1 — в Telegram ничего не отправлено, история не изменена")
         return 0
 
     bot_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
